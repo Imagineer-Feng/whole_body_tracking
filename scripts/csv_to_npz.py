@@ -10,6 +10,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib
 import numpy as np
 
 from isaaclab.app import AppLauncher
@@ -48,6 +49,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
+from isaaclab.sim.converters import urdf_converter as urdf_converter_module
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, quat_slerp
@@ -56,6 +58,85 @@ from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul, 
 # Pre-defined configs
 ##
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
+
+
+def _ensure_urdf_importer_available() -> None:
+    """Ensures URDF importer extension is loaded before spawning URDF assets.
+
+    Isaac Lab's URDF converter imports ``isaacsim.asset.importer.urdf._urdf`` directly.
+    In some app experiences this extension is not enabled yet when scene assets are created,
+    which leads to ``ModuleNotFoundError: isaacsim.asset``.
+    """
+
+    def _try_import() -> bool:
+        try:
+            importlib.import_module("isaacsim.asset.importer.urdf._urdf")
+            return True
+        except ModuleNotFoundError:
+            return False
+
+    if _try_import():
+        return
+
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    # Try base extension IDs first; Kit resolves the installed version automatically.
+    for ext_name in ("isaacsim.asset.importer.urdf", "omni.importer.urdf"):
+        try:
+            if not ext_manager.is_extension_enabled(ext_name):
+                ext_manager.set_extension_enabled_immediate(ext_name, True)
+        except Exception:
+            # Some versions may not expose all extension IDs; try next candidate.
+            continue
+
+        if _try_import():
+            return
+
+    raise ModuleNotFoundError(
+        "URDF importer module is unavailable. Please ensure extension "
+        "'isaacsim.asset.importer.urdf' is installed and enabled in this Kit experience."
+    )
+
+
+def _patch_urdf_importer_api_compat() -> None:
+    """Patches IsaacLab URDF converter for older URDF importer builds.
+
+    Some Isaac Sim 4.5 environments ship URDF importer versions where
+    ``ImportConfig.set_merge_fixed_ignore_inertia`` is unavailable.
+    """
+
+    # Avoid patching multiple times if script is reloaded in the same process.
+    if getattr(urdf_converter_module.UrdfConverter, "_wbt_compat_patched", False):
+        return
+
+    def _compat_get_urdf_import_config(self):
+        import omni.kit.commands
+
+        _, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
+
+        import_config.set_distance_scale(1.0)
+        import_config.set_make_default_prim(True)
+        import_config.set_create_physics_scene(False)
+
+        import_config.set_density(self.cfg.link_density)
+        convex_decomp = self.cfg.collider_type == "convex_decomposition"
+        import_config.set_convex_decomp(convex_decomp)
+        import_config.set_collision_from_visuals(self.cfg.collision_from_visuals)
+        import_config.set_merge_fixed_joints(self.cfg.merge_fixed_joints)
+        # Newer API only: keep compatibility with Isaac Sim 4.5 importer 2.3.x.
+        if hasattr(import_config, "set_merge_fixed_ignore_inertia"):
+            import_config.set_merge_fixed_ignore_inertia(self.cfg.merge_fixed_joints)
+
+        import_config.set_fix_base(self.cfg.fix_base)
+        import_config.set_self_collision(self.cfg.self_collision)
+        import_config.set_parse_mimic(self.cfg.convert_mimic_joints_to_normal_joints)
+        import_config.set_replace_cylinders_with_capsules(self.cfg.replace_cylinders_with_capsules)
+
+        return import_config
+
+    urdf_converter_module.UrdfConverter._get_urdf_import_config = _compat_get_urdf_import_config
+    urdf_converter_module.UrdfConverter._wbt_compat_patched = True
 
 
 @configclass
@@ -299,21 +380,38 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
                 log[k] = np.stack(log[k], axis=0)
 
             np.savez("/tmp/motion.npz", **log)
+            run = None
+            try:
+                import wandb
 
-            import wandb
+                COLLECTION = args_cli.output_name
+                run = wandb.init(project="csv_to_npz", name=COLLECTION)
+                print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
+                REGISTRY = "motions"
+                logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
+                try:
+                    run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
+                    print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+                except Exception as err:
+                    print(f"[WARN]: Failed to link artifact to registry, keeping logged artifact only: {err}")
+            except Exception as err:
+                print(f"[WARN]: Failed to log motion to wandb: {err}")
+            finally:
+                if run is not None:
+                    try:
+                        run.finish()
+                    except Exception:
+                        pass
 
-            COLLECTION = args_cli.output_name
-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-            REGISTRY = "motions"
-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+            # One-shot converter: stop after one full motion cycle is exported.
+            break
 
 
 def main():
     """Main function."""
     # Load kit helper
+    _ensure_urdf_importer_available()
+    _patch_urdf_importer_api_compat()
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
     sim_cfg.dt = 1.0 / args_cli.output_fps
     sim = SimulationContext(sim_cfg)
@@ -363,7 +461,9 @@ def main():
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        # run the main function
+        main()
+    finally:
+        # always close sim app cleanly
+        simulation_app.close()
