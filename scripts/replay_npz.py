@@ -9,6 +9,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib
 import numpy as np
 import torch
 
@@ -33,6 +34,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import SimulationContext
+from isaaclab.sim.converters import urdf_converter as urdf_converter_module
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
@@ -41,6 +43,72 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 ##
 from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
 from whole_body_tracking.tasks.tracking.mdp import MotionLoader
+
+
+def _ensure_urdf_importer_available() -> None:
+    """Ensures URDF importer extension is loaded before spawning URDF assets."""
+
+    def _try_import() -> bool:
+        try:
+            importlib.import_module("isaacsim.asset.importer.urdf._urdf")
+            return True
+        except ModuleNotFoundError:
+            return False
+
+    if _try_import():
+        return
+
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    for ext_name in ("isaacsim.asset.importer.urdf", "omni.importer.urdf"):
+        try:
+            if not ext_manager.is_extension_enabled(ext_name):
+                ext_manager.set_extension_enabled_immediate(ext_name, True)
+        except Exception:
+            continue
+
+        if _try_import():
+            return
+
+    raise ModuleNotFoundError(
+        "URDF importer module is unavailable. Please ensure extension "
+        "'isaacsim.asset.importer.urdf' is installed and enabled in this Kit experience."
+    )
+
+
+def _patch_urdf_importer_api_compat() -> None:
+    """Patches IsaacLab URDF converter for older URDF importer builds."""
+
+    if getattr(urdf_converter_module.UrdfConverter, "_wbt_compat_patched", False):
+        return
+
+    def _compat_get_urdf_import_config(self):
+        import omni.kit.commands
+
+        _, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
+
+        import_config.set_distance_scale(1.0)
+        import_config.set_make_default_prim(True)
+        import_config.set_create_physics_scene(False)
+
+        import_config.set_density(self.cfg.link_density)
+        convex_decomp = self.cfg.collider_type == "convex_decomposition"
+        import_config.set_convex_decomp(convex_decomp)
+        import_config.set_collision_from_visuals(self.cfg.collision_from_visuals)
+        import_config.set_merge_fixed_joints(self.cfg.merge_fixed_joints)
+        if hasattr(import_config, "set_merge_fixed_ignore_inertia"):
+            import_config.set_merge_fixed_ignore_inertia(self.cfg.merge_fixed_joints)
+
+        import_config.set_fix_base(self.cfg.fix_base)
+        import_config.set_self_collision(self.cfg.self_collision)
+        import_config.set_parse_mimic(self.cfg.convert_mimic_joints_to_normal_joints)
+        import_config.set_replace_cylinders_with_capsules(self.cfg.replace_cylinders_with_capsules)
+
+        return import_config
+
+    urdf_converter_module.UrdfConverter._get_urdf_import_config = _compat_get_urdf_import_config
+    urdf_converter_module.UrdfConverter._wbt_compat_patched = True
 
 
 @configclass
@@ -108,6 +176,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
 
 
 def main():
+    _ensure_urdf_importer_available()
+    _patch_urdf_importer_api_compat()
+
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
     sim_cfg.dt = 0.02
     sim = SimulationContext(sim_cfg)
