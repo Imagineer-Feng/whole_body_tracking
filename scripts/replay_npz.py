@@ -18,6 +18,12 @@ from isaaclab.app import AppLauncher
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay converted motions.")
 parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+parser.add_argument(
+    "--playback_speed",
+    type=float,
+    default=1.0,
+    help="Playback speed multiplier for motion replay (e.g., 0.5=half speed, 2.0=double speed).",
+)
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -152,10 +158,23 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
         sim.device,
     )
     time_steps = torch.zeros(scene.num_envs, dtype=torch.long, device=sim.device)
+    frame_accumulator = 0.0
+    motion_fps = float(motion.fps.item()) if hasattr(motion.fps, 'item') else float(motion.fps)
+    sim_dt_val = float(sim_dt.item()) if hasattr(sim_dt, 'item') else float(sim_dt)
+    frames_per_loop = motion_fps * float(args_cli.playback_speed) * sim_dt_val
+
+    print(
+        f"[INFO]: Replay speed={args_cli.playback_speed:.3f}x, motion_fps={motion_fps:.2f}, "
+        f"sim_dt={sim_dt_val:.4f}, expected_frame_advance_per_loop={frames_per_loop:.4f}"
+    )
 
     # Simulation loop
     while simulation_app.is_running():
-        time_steps += 1
+        frame_accumulator += frames_per_loop
+        frame_step = int(frame_accumulator)
+        if frame_step > 0:
+            time_steps += frame_step
+            frame_accumulator -= frame_step
         reset_ids = time_steps >= motion.time_step_total
         time_steps[reset_ids] = 0
 

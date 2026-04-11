@@ -94,8 +94,10 @@ This will automatically upload the processed motion file to the WandB registry w
 - Test if the WandB registry works properly by replaying the motion in Isaac Sim:
 
 ```bash
-python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-registry-motions/{motion_name}
+python scripts/replay_npz.py --registry_name={your-organization}-org/wandb-registry-motions/{motion_name} --playback_speed 1.0
 ```
+
+Set `--playback_speed` to change replay speed (e.g., `0.5` for half speed, `2.0` for double speed).
 
 - Debugging
     - Make sure to export WANDB_ENTITY to your organization name, not your personal username.
