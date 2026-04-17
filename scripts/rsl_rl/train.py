@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib
 import sys
 
 from isaaclab.app import AppLauncher
@@ -47,8 +48,10 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
+import pickle
 import torch
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -57,9 +60,10 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.sim.converters import urdf_converter as urdf_converter_module
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+from isaaclab.utils.io import dump_yaml
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -73,11 +77,104 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def dump_pickle(filename: str, data: object):
+    """Saves data into a pickle file safely.
+
+    Isaac Lab >=2.1.0 no longer exports ``dump_pickle`` from ``isaaclab.utils.io``.
+    This local helper keeps script behavior unchanged across versions.
+    """
+    if not filename.endswith("pkl"):
+        filename += ".pkl"
+    output_dir = os.path.dirname(filename)
+    if output_dir and (not os.path.exists(output_dir)):
+        os.makedirs(output_dir, exist_ok=True)
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
+
+
+def _get_rsl_rl_installed_version() -> str:
+    """Resolve installed rsl-rl package version across naming variants."""
+    for pkg_name in ("rsl-rl", "rsl_rl"):
+        try:
+            return pkg_version(pkg_name)
+        except PackageNotFoundError:
+            continue
+    # Fallback keeps compatibility helper path deterministic.
+    return "5.0.0"
+
+
+def _ensure_urdf_importer_available() -> None:
+    """Ensure URDF importer extension is enabled before spawning URDF assets."""
+
+    def _try_import() -> bool:
+        try:
+            importlib.import_module("isaacsim.asset.importer.urdf._urdf")
+            return True
+        except ModuleNotFoundError:
+            return False
+
+    if _try_import():
+        return
+
+    import omni.kit.app
+
+    ext_manager = omni.kit.app.get_app().get_extension_manager()
+    for ext_name in ("isaacsim.asset.importer.urdf", "omni.importer.urdf"):
+        try:
+            if not ext_manager.is_extension_enabled(ext_name):
+                ext_manager.set_extension_enabled_immediate(ext_name, True)
+        except Exception:
+            continue
+
+        if _try_import():
+            return
+
+    raise ModuleNotFoundError(
+        "URDF importer module is unavailable. Please ensure extension "
+        "'isaacsim.asset.importer.urdf' is installed and enabled in this Kit experience."
+    )
+
+
+def _patch_urdf_importer_api_compat() -> None:
+    """Patch URDF converter API differences across Isaac Sim 4.5 builds."""
+
+    if getattr(urdf_converter_module.UrdfConverter, "_wbt_compat_patched", False):
+        return
+
+    def _compat_get_urdf_import_config(self):
+        import omni.kit.commands
+
+        _, import_config = omni.kit.commands.execute("URDFCreateImportConfig")
+
+        import_config.set_distance_scale(1.0)
+        import_config.set_make_default_prim(True)
+        import_config.set_create_physics_scene(False)
+
+        import_config.set_density(self.cfg.link_density)
+        convex_decomp = self.cfg.collider_type == "convex_decomposition"
+        import_config.set_convex_decomp(convex_decomp)
+        import_config.set_collision_from_visuals(self.cfg.collision_from_visuals)
+        import_config.set_merge_fixed_joints(self.cfg.merge_fixed_joints)
+        if hasattr(import_config, "set_merge_fixed_ignore_inertia"):
+            import_config.set_merge_fixed_ignore_inertia(self.cfg.merge_fixed_joints)
+
+        import_config.set_fix_base(self.cfg.fix_base)
+        import_config.set_self_collision(self.cfg.self_collision)
+        import_config.set_parse_mimic(self.cfg.convert_mimic_joints_to_normal_joints)
+        import_config.set_replace_cylinders_with_capsules(self.cfg.replace_cylinders_with_capsules)
+
+        return import_config
+
+    urdf_converter_module.UrdfConverter._get_urdf_import_config = _compat_get_urdf_import_config
+    urdf_converter_module.UrdfConverter._wbt_compat_patched = True
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _get_rsl_rl_installed_version())
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -109,6 +206,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+
+    # Ensure URDF importer works across Isaac Sim 4.5 variants before env creation.
+    _ensure_urdf_importer_available()
+    _patch_urdf_importer_api_compat()
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
