@@ -35,7 +35,7 @@ Quick examples:
      python scripts/rsl_rl/evaluate.py \
          --task Tracking-Flat-G1-v0 \
          --wandb_path imagineer-feng-shanghai-jiao-tong-university/beyondmimic_repo/d1s1formal30000_bnrfmt \
-         --checkpoint_names model_28000.pt model_28500.pt model_29000.pt model_29500.pt model_30000.pt \
+         --checkpoint_names model_28000.pt model_28500.pt model_29000.pt model_29500.pt model_29999.pt \
          --motion_file /home/imagineerfeng/whole_body_tracking/artifacts/dance1_subject1:v0/motion.npz \
          --num_envs 64 --num_episodes 200 --seeds 0 1 2 3 4 \
          --disable_randomization --disable_obs_noise --disable_early_termination --headless
