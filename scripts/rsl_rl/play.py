@@ -264,7 +264,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Playback should continue even when exporter internals differ across rsl_rl versions.
             print(f"[WARN]: ONNX export failed, continuing playback without export: {err}")
     # reset environment
-    obs, _ = env.get_observations()
+    obs_result = env.get_observations()
+    obs = obs_result[0] if isinstance(obs_result, tuple) else obs_result
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
